@@ -74,9 +74,9 @@ tracing-subscriber = { version = "0.3", features = [
 # tracing-appender = "0.2"
 
 # trustdns
-trust-dns-proto = { version = "0.23.0-alpha.3"}
-trust-dns-resolver = { version = "0.23.0-alpha.3", features = ["serde-config", "system-config"]}
-trust-dns-server = { version = "0.23.0-alpha.3", features = ["resolver"]}
+trust-dns-proto = { version = "=0.23.0-alpha.3"}
+trust-dns-resolver = { version = "=0.23.0-alpha.3", features = ["serde-config", "system-config"]}
+trust-dns-server = { version = "=0.23.0-alpha.3", features = ["resolver"]}
 
 # ssl
 webpki-roots = "0.23.0"
