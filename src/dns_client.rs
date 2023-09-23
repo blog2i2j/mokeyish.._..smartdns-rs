@@ -31,6 +31,7 @@ use trust_dns_resolver::{
     config::{NameServerConfig, Protocol, ResolverOpts, TlsClientConfig},
     lookup::Lookup,
     lookup_ip::LookupIp,
+    name_server::GenericConnector,
     TryParseIp,
 };
 
@@ -138,8 +139,6 @@ impl DnsClientBuilder {
                     }
                 }
 
-                let resolver = BootstrapResolver::from_system_conf();
-
                 let resolver: Arc<BootstrapResolver> = if !bootstrap_infos.is_empty() {
                     let new_resolver = factory
                         .create_name_server_group(
@@ -148,11 +147,12 @@ impl DnsClientBuilder {
                             client_subnet,
                         )
                         .await;
-                    resolver.with_new_resolver(new_resolver.into())
+                    BootstrapResolver::new(new_resolver.into())
                 } else {
-                    resolver
+                    BootstrapResolver::from_system_conf()
                 }
                 .into();
+
                 resolver
             }
             .await,
@@ -463,10 +463,10 @@ impl NameServerFactory {
 
         let config = Self::create_config_from_url(url, self.tls_client_config.clone());
 
-        let inner = N::<TokioRuntimeProvider>::new(
+        let inner = N::<GenericConnector<TokioRuntimeProvider>>::new(
             config,
             resolver_opts.deref().to_owned(),
-            TokioRuntimeProvider::new(proxy, so_mark),
+            GenericConnector::new(TokioRuntimeProvider::new(proxy, so_mark)),
         );
 
         let ns = Arc::new(NameServer {
@@ -616,7 +616,7 @@ impl NameServerFactory {
 
 pub struct NameServer {
     opts: NameServerOpts,
-    inner: trust_dns_resolver::name_server::NameServer<TokioRuntimeProvider>,
+    inner: trust_dns_resolver::name_server::NameServer<GenericConnector<TokioRuntimeProvider>>,
 }
 
 impl NameServer {
@@ -628,10 +628,10 @@ impl NameServer {
     ) -> Self {
         use trust_dns_resolver::name_server::NameServer as N;
 
-        let inner = N::<TokioRuntimeProvider>::new(
+        let inner = N::<GenericConnector<TokioRuntimeProvider>>::new(
             config,
             opts.resolver_opts,
-            TokioRuntimeProvider::new(proxy, so_mark),
+            GenericConnector::new(TokioRuntimeProvider::new(proxy, so_mark)),
         );
 
         Self { opts, inner }
