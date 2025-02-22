@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub use crate::config::*;
 use crate::dns::DomainRuleGetter;
+use crate::infra::ipset::IpMap;
 use crate::log;
 use crate::{
     dns_rule::{DomainRuleMap, DomainRuleTreeNode},
@@ -41,6 +42,8 @@ pub struct RuntimeConfig {
 
     /// List of IPs that will be ignored
     ignore_ip: Arc<IpSet>,
+
+    ip_alias: Arc<IpMap<Arc<[IpAddr]>>>,
 }
 
 impl RuntimeConfig {
@@ -337,6 +340,10 @@ impl RuntimeConfig {
         &self.ignore_ip
     }
 
+    pub fn ip_alias(&self) -> &Arc<IpMap<Arc<[IpAddr]>>> {
+        &self.ip_alias
+    }
+
     /// speed check mode
     #[inline]
     pub fn speed_check_mode(&self) -> Option<&SpeedCheckModeList> {
@@ -609,10 +616,34 @@ impl RuntimeConfigBuilder {
             cfg.listeners.push(UdpListenerConfig::default().into())
         }
 
-        let bogus_nxdomain: Arc<IpSet> = cfg.bogus_nxdomain.compact().into();
-        let blacklist_ip: Arc<IpSet> = cfg.blacklist_ip.compact().into();
-        let whitelist_ip: Arc<IpSet> = cfg.whitelist_ip.compact().into();
-        let ignore_ip: Arc<IpSet> = cfg.ignore_ip.compact().into();
+        fn get_ip_set<'a>(ip: &'a IpOrSet, cfg: &'a Config) -> &'a [IpNet] {
+            match ip {
+                IpOrSet::Net(net) => std::slice::from_ref(net),
+                IpOrSet::Set(name) => match cfg.ip_sets.get(name) {
+                    Some(net) => net,
+                    None => {
+                        warn!("unknown ip-set:{name}");
+                        &[]
+                    }
+                },
+            }
+        }
+
+        let make_ip_set = |set: &[IpOrSet]| {
+            let iter = set.iter().flat_map(|ip| get_ip_set(ip, &cfg));
+            Arc::new(IpSet::new(iter.copied()))
+        };
+
+        let bogus_nxdomain = make_ip_set(&cfg.bogus_nxdomain);
+        let blacklist_ip = make_ip_set(&cfg.blacklist_ip);
+        let whitelist_ip = make_ip_set(&cfg.whitelist_ip);
+        let ignore_ip = make_ip_set(&cfg.ignore_ip);
+
+        let ip_alias = cfg.ip_alias.iter().flat_map(|alias| {
+            let to = std::iter::repeat(alias.to.clone());
+            get_ip_set(&alias.ip, &cfg).iter().copied().zip(to)
+        });
+        let ip_alias = Arc::new(IpMap::from_iter(ip_alias));
 
         if !cfg.cnames.is_empty() {
             cfg.cnames.dedup_by(|a, b| a.domain == b.domain);
@@ -738,6 +769,7 @@ impl RuntimeConfigBuilder {
             blacklist_ip,
             whitelist_ip,
             ignore_ip,
+            ip_alias,
             proxy_servers: Arc::new(proxy_servers),
         }
     }
@@ -844,10 +876,10 @@ impl RuntimeConfigBuilder {
                 LogFilter(v) => self.log.filter = Some(v),
                 LogSize(v) => self.log.size = Some(v),
                 MaxReplyIpNum(v) => self.max_reply_ip_num = Some(v),
-                BlacklistIp(v) => self.blacklist_ip += v,
-                BogusNxDomain(v) => self.bogus_nxdomain += v,
-                WhitelistIp(v) => self.whitelist_ip += v,
-                IgnoreIp(v) => self.ignore_ip += v,
+                BlacklistIp(v) => self.blacklist_ip.push(v),
+                BogusNxDomain(v) => self.bogus_nxdomain.push(v),
+                WhitelistIp(v) => self.whitelist_ip.push(v),
+                IgnoreIp(v) => self.ignore_ip.push(v),
                 CaFile(v) => self.ca_file = Some(v),
                 CaPath(v) => self.ca_path = Some(v),
                 ConfFile(v) => {
@@ -879,7 +911,22 @@ impl RuntimeConfigBuilder {
                     self.proxy_servers.insert(v.name.clone(), v.config);
                 }
                 HostsFile(file) => self.hosts_file = Some(file),
+                IpSetProvider(p) => {
+                    let path = resolve_filepath(&p.file, self.conf_file.as_ref());
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => {
+                            let net = self.ip_sets.entry(p.name.clone()).or_default();
+                            let len = net.len();
+                            net.extend(parse_ip_set_file(&text));
+                            log::info!("IpSet load {} records into {}", net.len() - len, p.name);
+                        }
+                        Err(err) => {
+                            log::error!("IpSet load failed {} {}", p.name, err);
+                        }
+                    }
+                }
                 MdnsLookup(enable) => self.mdns_lookup = Some(enable),
+                IpAlias(alias) => self.ip_alias.push(alias),
                 // #[allow(unreachable_patterns)]
                 // c => log::warn!("unhandled config {:?}", c),
             },
@@ -1573,5 +1620,36 @@ mod tests {
         let cfg = RuntimeConfig::builder().with("https-record #").build();
         assert_eq!(cfg.https_records.len(), 1);
         assert_eq!(cfg.https_records[0].config, HttpsRecordRule::SOA);
+    }
+
+    #[test]
+    fn test_ip_set() {
+        let cfg = RuntimeConfig::load_from_file("tests/test_data/b_main.conf");
+
+        let v4: Vec<_> = include_str!("../tests/test_data/cf-ipv4.txt")
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        let v6: Vec<_> = include_str!("../tests/test_data/cf-ipv6.txt")
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        let all: [&[_]; 3] = [&["1.1.1.1/32".parse().unwrap()], &v4, &v6];
+        let all = IpSet::new(all.into_iter().flatten().copied());
+
+        assert_eq!(cfg.ip_sets["cf-ipv4"], v4);
+        assert_eq!(cfg.ip_sets["cf-ipv6"], v6);
+        assert_eq!(*cfg.whitelist_ip, all);
+    }
+
+    #[test]
+    fn test_ip_alias() {
+        let cfg = RuntimeConfig::load_from_file("tests/test_data/b_main.conf");
+        let addr = |s: &str| s.parse::<IpAddr>().unwrap();
+        let get_alias = |s: &str| &**cfg.ip_alias.get(&addr(s)).unwrap();
+
+        assert_eq!(get_alias("104.16.0.0"), [addr("1.2.3.4"), addr("::5678")]);
+        assert_eq!(get_alias("2400:cb00::"), [addr("::1234"), addr("5.6.7.8")]);
+        assert_eq!(get_alias("172.64.0.0"), [addr("90AB::CDEF")]);
     }
 }
